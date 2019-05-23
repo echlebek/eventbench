@@ -27,18 +27,23 @@ var (
 )
 
 const ddl = `CREATE TABLE IF NOT EXISTS events (
-  ns        text,
-  entity    text,
-  checkname text,
-  data      jsonb,
-  PRIMARY KEY (ns, entity, checkname)
+    id              serial     PRIMARY KEY,
+    sensu_namespace text       NOT NULL,
+    sensu_check     text       NOT NULL,
+    sensu_entity    text       NOT NULL,
+    history_index   integer    DEFAULT 2,
+	history_ts      integer[],
+	history_status  integer[],
+    serialized      jsonb, 
+    UNIQUE ( sensu_namespace, sensu_check, sensu_entity )
 );`
 
-const readEventQuery = `SELECT data FROM events
-WHERE ns = $1 AND entity = $2 AND checkname = $3;`
-
-const writeEventQuery = `INSERT INTO events (ns, entity, checkname, data)
-VALUES ($1, $2, $3, $4) ON CONFLICT (ns, entity, checkname) DO UPDATE SET data=$4;`
+const writeEventQuery = `INSERT INTO events
+    ( sensu_namespace, sensu_check, sensu_entity, history_ts, history_status, serialized )
+	VALUES ( $1, $2, $3, ARRAY[$4]::integer[], ARRAY[$5]::integer[], $6 )
+	ON CONFLICT ( sensu_namespace, sensu_check, sensu_entity ) DO UPDATE SET
+		( history_ts[events.history_index], history_status[events.history_index], history_index, serialized ) = (
+			$4, $5, (events.history_index % 20) + 1, $6 );`
 
 func initTest(db *sql.DB) error {
 	_, err := db.Exec(ddl)
@@ -89,18 +94,12 @@ func eventCounter() {
 	}
 }
 
-func bencher(ctx context.Context, write, read *sql.Stmt, index int, eventNames []string, serialized []byte) {
+func bencher(ctx context.Context, write *sql.Stmt, index int, eventNames []string, serialized []byte) {
 	j := index
 	for ctx.Err() == nil {
 		eventName := eventNames[j]
 		j = (j + index) % len(eventNames)
-		var data []byte
-		row := read.QueryRowContext(ctx, "default", eventName, eventName)
-		if err := row.Scan(&data); err != nil && ctx.Err() == nil && err != sql.ErrNoRows {
-			log.Printf("error executing read: %s", err)
-			continue
-		}
-		_, err := write.ExecContext(ctx, "default", eventName, eventName, serialized)
+		_, err := write.ExecContext(ctx, "default", eventName, eventName, 1, 1, serialized)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("error executing write: %s", err)
 			continue
@@ -132,20 +131,14 @@ func doBench(db *sql.DB) error {
 		cancel()
 	}()
 
-	read, err := db.PrepareContext(ctx, readEventQuery)
-	if err != nil && err != context.Canceled {
-		return fmt.Errorf("error preparing read statement: %s", err)
-	}
-	defer read.Close()
-
 	write, err := db.PrepareContext(ctx, writeEventQuery)
 	if err != nil && err != context.Canceled {
-		return fmt.Errorf("error preparing read statement: %s", err)
+		return fmt.Errorf("error preparing write statement: %s", err)
 	}
 	defer write.Close()
 
 	for i := 0; i < *concurrency; i++ {
-		go bencher(ctx, write, read, i, eventNames, serialized)
+		go bencher(ctx, write, i, eventNames, serialized)
 	}
 
 	<-ctx.Done()
